@@ -47,7 +47,7 @@ the major goal of this experiment is to stabilize inverse problem pipeline in Vi
 ├── pyproject.toml
 ├── src/
 │   ├── models/
-│   │   ├── UNet.py                
+│   │   ├── unet2d.py                
 │   │   ├── diffusion.py           
 │   │   └── vit.py         
 │   ├── denoiser/
