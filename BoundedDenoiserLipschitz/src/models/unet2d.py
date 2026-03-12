@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import dataclasses
+
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from torch.utils.data import Dataset, DataLoader
 
-import argparse
-import math
 import os
 import random
-import time
 
 import torch
 import torch.nn as nn
@@ -27,8 +25,8 @@ def seed_everything(seed: int = 42) -> None:
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # backends.cudnn.deterministic = True
-    # backends.cudnn.benchmark = False
+    backends.cudnn.deterministic = True
+    backends.cudnn.benchmark = False
 
 
 def _choose_groupnorm_groups(num_channels: int, max_groups: int) -> int:
@@ -53,7 +51,7 @@ class SyntheticBlobs2D(Dataset):
             n_blobs_range: Tuple[int, int] = (1, 4),
             radius_range: Tuple[float, float] = (6.0, 14.0),
             noise_std: float = 0.25,
-            seed: int = 123,
+            seed: int = 12,
     ) -> None:
         super().__init__()
         self.n_samples = n_samples
@@ -65,7 +63,7 @@ class SyntheticBlobs2D(Dataset):
 
         self.torch_gen = torch.Generator().manual_seed(seed)
 
-        # normalized coordinate grid (L, W, 3)
+        # normalized coordinate grid (D, L, W, 3)
         L, W = size
         ys = torch.linspace(-1.0, 1.0, L)
         xs = torch.linspace(-1.0, 1.0, W)
@@ -97,7 +95,7 @@ class SyntheticBlobs2D(Dataset):
             r_norm = radius * (2.0 / avg_axis)
 
             center = torch.tensor([cy, cx], dtype=torch.float32)
-            dist = torch.norm(self.grid - center, dim=-1)  # (D, L, W)
+            dist = torch.norm(self.grid - center, dim=-1)  # (L, W)
             blob = (dist <= r_norm).float()
             mask = torch.maximum(mask, blob)
 
@@ -188,11 +186,11 @@ class Upsample2D(nn.Module):
         x = self.post(x)
 
         return x
-
-
+    
 # ---------------------------------------
 # UNet2D
 # ---------------------------------------
+
 class UNet2D(nn.Module):
     """
     Lightweight 2D Unet with ResNet blocks and GroupNorm
@@ -232,7 +230,7 @@ class UNet2D(nn.Module):
             self.ups.append(Upsample2D(channels[i], channels[i - 1], dropout=dropout, groups=groups))
             self.decs.append(ResNetBlock2D(channels[i - 1] * 2, channels[i - 1], dropout=dropout, groups=groups))
 
-        self.out = nn.Conv2d(channels[0], out_channels, kernel_size=1)
+        self.out = nn.Conv2d(channels[0], out_channels, kernel_size=1) # Changed from nn.Conv3d to nn.Conv2d
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         skips = []
@@ -255,10 +253,12 @@ class UNet2D(nn.Module):
             l = dec(l)
 
         return self.out(l)
+    
+def model_sanity_check(model, x):
+    m = model(in_channels=1, out_channels=1, base_channels=16, num_levels=4).to('cuda').eval()
+    x = x.to('cuda')
 
-def unet2d_test():
-    m = UNet2D(in_channels=1, out_channels=1, base_channels=16, num_levels=4).to('cuda').eval()
-    x = torch.randn(2, 1, 256, 256).to('cuda')
-    y = m(x)
-    print(y.shape)
-    summary(m, input_size=(1, 256, 256), device='cuda')
+    print("x imported:", x.shape, x.ndim)
+
+
+    summary(m, input_size=x.shape, device='cuda')

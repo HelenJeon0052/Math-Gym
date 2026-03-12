@@ -3,9 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-from models.attention import AttentionMLP
-
-
 def _choose_groupnorm_vit(num_channels: int, max_groups: int =8) -> int:
     for g in range(min(max_groups, num_channels), 0, -1):
         if num_channels % g == 0:
@@ -13,11 +10,11 @@ def _choose_groupnorm_vit(num_channels: int, max_groups: int =8) -> int:
     return 1
 
 class ConvGNact2D(nn.Module):
-    def __init__(self, in_channels, out_channels, dropout=0.0):
+    def __init__(self, in_channel, out_channels, dropout=0.0):
         super().__init__()
         g = _choose_groupnorm_vit(num_channels=out_channels)
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channel, out_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(g, out_channels),
             nn.GELU(),
             nn.Dropout2d(dropout) if dropout < 0 else nn.Identity(),
@@ -29,10 +26,10 @@ class FusionBlock2D(nn.Module):
     """
     upsampled feature + skip > refined feature
     """
-    def __init__(self, in_channels, out_channels, dropout=0.0):
+    def __init__(self, in_channel, out_channels, dropout=0.0):
         super().__init__()
         self.block = nn.Sequential(
-            ConvGNact2D(in_channels, out_channels, dropout=dropout),
+            ConvGNact2D(in_channel, out_channels, dropout=dropout),
             ConvGNact2D(out_channels, out_channels, dropout=dropout),
         )
 
@@ -42,50 +39,51 @@ class FusionBlock2D(nn.Module):
         print(f'after concat: {x.shape}')
         return self.block(x)
 
-
-class HierarchicalEncoder2D(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 embed_dim,
-                 depth,
-                 sr_ratio,
-                 num_heads=None,
-                 patch_size=4):
+class TimeEmbed(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        assert len(embed_dim) == len(depth) == len(sr_ratio)
-        self.num_stages = len(embed_dim)
-        if num_heads is None:
-            num_heads = [max(1, d // 64) for d in embed_dim]
+        self.mlp = MLP(dim)
+        
+    def forward(self, t):
+        if t.ndim == 4:
+            t = t[:, 0, 0, 0]
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        
+        print(f'expected t: [b, dim] | {t.shape}')
+        return self.mlp(t)
 
-        self.patch_embed = ViT2DPatchEmbed(in_channels, embed_dim[0], patch_size=patch_size)
-
-        self.stages = nn.ModuleList()
-        self.dows = nn.ModuleList()
-
-        for i in range(self.num_stages):
-            dim = embed_dim[i]
-            hd = num_heads[i]
-            sr = sr_ratio[i]
-            dth = depth[i]
-
-            blocks = nn.ModuleList()
-
-            embed = ViT2DPatchEmbed(
-                in_channels if i==0 else embed_dim[i-1],
-                embed_dim[i],
-                kernel=[7,3,3,3][i],
-                stride=[4,2,2,2][i]
-            )
-            blocks = nn.ModuleList([
-                AttentionMLP(embed_dim[i], 1<<i, sr_ratio[i])
-                for _ in range(depth[i])
-            ])
-
+class MLP(nn.Module):
+    def __init__(self, dim, mlp_ratio, dropout=0.0):
+        super().__init__()
+        ratio = int(dim * mlp_ratio)
+        self.fc1 = nn.Linear(dim, ratio)
+        self.fc2 = nn.Linear(ratio, dim)
+        self.drop = nn.Dropout(dropout)
+        self.act = nn.GeLU()
+        
     def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        
+        return x
 
-        tok, grid, feat = self.patch_embed
-        feats = []
-        return feats
+class AttentionMLP(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio, dropout=0.0, attn_drop=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiHeadAttention(dim, num_heads, dropout=dropout, attn_drop=attn_drop)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, dropout)
+        
+    def forward(self, x):
+        x = self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        
+        return x
 
 class MLPDecoder(nn.Module):
     """
@@ -128,16 +126,15 @@ class MLPDecoder(nn.Module):
 class ViT2DPatchEmbed(nn.Module):
     """
     transforms 2D medical volumes into sequences of tokens
-    u = f(x, y)
     """
 
-    def __init__(self, patch_size=4, in_channels=1, embed_dim=768, kernel=None, stride=None):
+    def __init__(self, patch_size, in_channel, embed_dim, kernel=None, stride=None):
         super().__init__()
         self.patch_size = patch_size
-        self.proj = nn.Conv2d(in_channels=in_channels, emded_dim=embed_dim, kernel_size=kernel, stride=stride, bias=False)
+        self.proj = nn.Conv2d(in_channels=in_channel, emded_dim=embed_dim, kernel_size=kernel, stride=stride, bias=False)
 
     def forward(self, x):
-        # [B, dim, Ll, Ww]
+        # [B, dim, Ll, Ww] > [b, n ,d]
         x = self.proj(x)
         B, C, L, W = x.shape
         tokens = x.flatten(2).transpose(1, 2)
@@ -161,44 +158,56 @@ class PatchMerging2D(nn.Module):
 
         return tokens, (L, W), feat
 
+class ViTEndPointDenoiser(nn.Module):
+    """
+    predict x0_hat = D_theta(x_t, t) in a direct way
+    expected:
+     - input : x_t [b, c, l, w], t [b] || [b, 1] || [b, 1, 1, 1]
+     - output : x0_hat [b, c, l, W]
+    """
 
-class Light2DVit(nn.Module):
-    def __init__(self,
-                 in_channels=4,
-                 num_classes=3,
-                 embed_dim=(48, 96, 192, 384),
-                 depths=(2, 2, 2, 2),
-                 sr_ratios=(4, 2, 1, 1),
-                 block_type='sr',
-                 ode_mode='strang',
-                 ode_steps_attn=2,
-                 ode_steps_mlp=1,
-                 ode_steps_fric=1,
-                 use_friction=True,
-                 friction_position='mid',
-                 patch_size=4):
+    def __init__(self, img_size=256, patch=4, in_channel=1, dim=512, depth=8, num_heads=8, mlp_ratio=3.0, dropout=0.0, attn_drop=0.0):
         super().__init__()
-        self.encoder = HierarchicalEncoder2D(
-            in_channels=in_channels,
-            embed_dim=list(embed_dim),
-            depth=list(depths),
-            sr_ratio=list(sr_ratios),
-            mlp_ratio=4.0,
-            dropout=0.0,
-            attn_drop=0.0,
-            block_type=block_type,
-            ode_mode=ode_mode,
-            ode_steps_attn=ode_steps_attn,
-            ode_steps_mlp=ode_steps_mlp,
-            ode_steps_fric=ode_steps_fric,
-            use_friction=use_friction,
-            friction_position=friction_position,
-            patch_size=patch_size
-        )
-        self.decoder = MLPDecoder(list(embed_dim)[::-1], num_classes=num_classes)
+        if img_size % patch != 0:
+            raise ValueError ('patch * img_size = int')
 
-    def forward(self, x):
-        feats = self.encoder(x)
-        out = self.decoder(feats)
+        self.img_size = img_size
+        self.patch = patch
+        self.in_channel = in_channel
+        self.grid = img_size // patch
+        self.num_tokens = self.grid * self.grid
+
+        self.patch_embed = ViT2DPatchEmbed(in_channel=in_channel, kerner_size=self.patch, stride=self.patch, bias=True)
+        self.position = nn.Parameter(torch.zeros(1, self.num_tokens, dim))
+
+        self.time = TimeEmbed(dim)
+
+        self.blocks = nn.ModuleList(
+            [AttentionMLP(
+                dim=dim, num_heads=num_heads, cond_dim=dim, mlp_ratio=mlp_ratio, dropout=dropout
+            ) for _ in range(depth)]
+        )
+
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, ((patch**2*in_channel)))
+
+        nn.init.trunc_normal_(self.position, std=.02)
+    
+    def forward(self, x_t, t):
+        B = x_t.shape[0]
+        cond = self.time(t)
+        token = self.patch_embed(x_t).flatten(2).transpose(1, 2)
+        token = token + self.position
+
+        for blk in self.blocks:
+            token = blk(token, cond)
+        
+        token = self.norm(token)
+        out = self.head(token)
+
+        out = out.view(B, self.num_tokens, self.in_channel, self.patch, self.patch)
+        out = out.permute(0,2,1,3,4).contiguous()
+        out = out.view(B, self.in_channel, self.grid, self.grid, self.patch, self.patch)
+        out = out.permute(0,1,2,4,3,5).contiguous().view(B, self.in_channel, self.img_size, self.img_size)
 
         return out

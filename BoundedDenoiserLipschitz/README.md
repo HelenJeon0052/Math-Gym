@@ -51,11 +51,7 @@ the major goal of this experiment is to stabilize inverse problem pipeline in Vi
 │   │   ├── diffusion.py           
 │   │   └── vit.py         
 │   ├── denoiser/
-│   │   ├── denoiser.py
 │   │   └── SN_wrappers.py
-│   ├── jacobian_reg/
-│   │   ├── jacobian_reg_loss.py        
-│   │   └── 
 │   ├── operators/
 │   ├── pnp/
 │   │   ├── ADMM_loop.py         
@@ -66,8 +62,7 @@ the major goal of this experiment is to stabilize inverse problem pipeline in Vi
 ├── notebooks/
 │   ├── 00_env_check.ipynb
 │   ├── 01_train_denoiser_realsn_jacreg.ipynb
-│   ├── 02_pnp_admm_find_xstar.ipynb
-│   └── 03_ablation_grid.ipynb
+│   └── 02_ablation_grid.ipynb
 └── outputs/
     ├── checkpoints/
     └── results/
